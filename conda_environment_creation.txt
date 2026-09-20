@@ -1,0 +1,22 @@
+>> Miniconda is useful for creating  isolated global enviroment for all language support unlike pythin venv.
+
+Download the miniconda installer:
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+
+
+Install miniconda as whole anaconda is very big in size:
+bash Miniconda3-latest-Linux-x86_64.sh
+
+
+after installing run this to restart bash shell
+source ~/.bashrc
+
+Create an env of name=myenv with specific python version
+conda create -n myenv python=3.10
+
+Activate it:
+conda activate myenv
+
+
+conda env list
+
