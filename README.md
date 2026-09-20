@@ -111,28 +111,18 @@ LLM_from_Scratch/
 │
 ├── README.md
 ├── requirements.txt
-├── .gitignore
 │
-├── notebooks/
-│   ├── 01_working_with_text_data.ipynb
-│   ├── 02_coding_attention_mechanism.ipynb
-│   ├── 03_implementing_gpt_from_scratch.ipynb
-│   └── 04_pretraining_llm.ipynb
+├── working_with_text_data.ipynb
+├── coding_attention_mechanism.ipynb
+├── implementing_gpt_from_scratch.ipynb
+├── pretraining_llm.ipynb
 │
-├── src/
-│   └── gpt_components.py
+├── gpt_components.py
 │
-├── assets/
-│   └── pics/
+├── the-verdict.txt
+├── pics/
 │
-├── data/
-│   └── the-verdict.txt
-│
-├── docs/
-│   └── environment_setup.md
-│
-└── references/
-    └── README.md
+├── conda_environment_creation.txt
 ```
 
 # References
