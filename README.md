@@ -1,4 +1,4 @@
-LLM From Scratch
+# LLM From Scratch
 
 A hands-on implementation and study repository for understanding Large Language Models from the ground up using PyTorch.
 
@@ -9,45 +9,50 @@ The goal of this repository is to move beyond using pretrained models and unders
 The repository follows a progressive path from the fundamentals of language modeling to complete GPT-style architectures.
 
 1. Working with Text Data
-Raw text preprocessing
-Tokenization
-Token IDs
-Vocabulary construction
-Input-target pair creation
-Context windows
-Dataset and DataLoader construction
-Batch generation
-2. Attention Mechanisms
+
+* Raw text preprocessing
+* Tokenization
+* Token IDs
+* Vocabulary construction
+* Input-target pair creation
+* Context windows
+* Dataset and DataLoader construction
+* Batch generation
+
+3. Attention Mechanisms
 
 Implementing attention mechanisms step by step:
 
-Basic attention
-Query, Key, and Value representations
-Attention scores
-Scaled dot-product attention
-Causal attention
-Multi-head attention
-Masking
-Dropout in attention
+* Basic attention
+* Query, Key, and Value representations
+* Attention scores
+* Scaled dot-product attention
+* Causal attention
+* Multi-head attention
+* Masking
+* Dropout in attention
+
 3. Transformer Architecture
 
 Understanding and implementing the main components of a Transformer decoder:
 
-Token embeddings
-Positional embeddings
-Layer Normalization
-Feed-forward networks
-Residual connections
-Multi-head causal self-attention
-Transformer blocks
-Output projection
-Weight tying
+* Token embeddings
+* Positional embeddings
+* Layer Normalization
+* Feed-forward networks
+* Residual connections
+* Multi-head causal self-attention
+* Transformer blocks
+* Output projection
+* Weight tying
+
 4. GPT From Scratch
 
 Building a GPT-style decoder-only language model in PyTorch.
 
-The implementation covers:
+The implementation follows this architecture:
 
+```text
 Input Tokens
      ↓
 Token Embeddings
@@ -68,36 +73,40 @@ Output Projection
 Logits
      ↓
 Next Token Prediction
+```
+
 5. Training and Pretraining
 
-Exploring the training process of language models:
-
-Next-token prediction
-Cross-entropy loss
-Training and validation loss
-Optimizers
-Gradient computation
-Backpropagation
-Model evaluation
-Autoregressive generation
+* Next-token prediction
+* Cross-entropy loss
+* Training and validation loss
+* Optimizers
+* Gradient computation
+* Backpropagation
+* Model evaluation
+* Autoregressive generation
+  
 6. Text Generation
 
 Understanding how a trained language model generates text one token at a time.
 
 Topics include:
 
-Autoregressive generation
-Context windows
-Logits and probability distributions
-Sampling
-Temperature
-Top-k sampling
-Sequential token generation
+* Autoregressive generation
+* Context windows
+* Logits and probability distributions
+* Sampling
+* Temperature
+* Top-k sampling
+* Sequential token generation
+  
 7. Reasoning Models
 
 The repository also explores the foundations of reasoning-oriented language models and how reasoning can be incorporated into language-model training and inference.
 
-# Repository Structure
+## Repository Structure
+
+```text
 LLM_from_Scratch/
 │
 ├── README.md
@@ -121,12 +130,17 @@ LLM_from_Scratch/
 │
 ├── docs/
 │   └── environment_setup.md
+│
+└── references/
+    └── README.md
+```
 
 # References
 
 In this repository I have used Sebastian Raschka's books as the primary references for learning and implementing the concepts covered here.
 1. Sebastian Raschka — [Build a Large Language Model (From Scratch)]
 2. Sebastian Raschka — [Build a Reasoning Model (From Scratch)]
+3. Also checkout his code repo as well: 
 │
 └── references/
     └── README.md
