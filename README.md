@@ -1,4 +1,4 @@
-# LLM From Scratch
+# LLM From Scratch Using Pytorch
 
 A hands-on implementation and study repository for understanding Large Language Models from the ground up using PyTorch.
 
@@ -138,8 +138,8 @@ LLM_from_Scratch/
 # References
 
 In this repository I have used Sebastian Raschka's books as the primary references for learning and implementing the concepts covered here.
-1. Sebastian Raschka — [Build a Large Language Model (From Scratch)]
-2. Sebastian Raschka — [Build a Reasoning Model (From Scratch)]
+1. Sebastian Raschka — Build a Large Language Model (From Scratch)
+2. Sebastian Raschka — Build a Reasoning Model (From Scratch)
 3. Also checkout his code repo as well: [rasbt](https://github.com/rasbt/LLMs-from-scratch.git)
 
 
