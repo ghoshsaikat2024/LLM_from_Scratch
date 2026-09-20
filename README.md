@@ -140,9 +140,8 @@ LLM_from_Scratch/
 In this repository I have used Sebastian Raschka's books as the primary references for learning and implementing the concepts covered here.
 1. Sebastian Raschka — [Build a Large Language Model (From Scratch)]
 2. Sebastian Raschka — [Build a Reasoning Model (From Scratch)]
-3. Also checkout his code repo as well: 
-│
-└── references/
-    └── README.md
+3. Also checkout his code repo as well: [rasbt](https://github.com/rasbt/LLMs-from-scratch.git)
+
+
 
 The exact structure may evolve as the implementation grows.
