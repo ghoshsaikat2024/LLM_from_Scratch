@@ -262,7 +262,67 @@ class GPTModel(nn.Module):
         
         return  logits
 
+
+
+
+def generate_text_greedy(model, input_idx, max_new_tokens, context_length):
+
+    for _ in range(max_new_tokens):
+        input_idx = input_idx[:, -context_length:]   #Input Indices is of Shape:(batch, num_token_ids)
+        #Disables gradient tracking since we are not training yet
+        with torch.no_grad(): # To avoid storing the computational Graph
+            logits = model(input_idx)                   #Output SHape : (batch, num_tokens, vocab_dim)
+
+        logits = logits[:, -1, :]                   #Output Shape: (batch, 1, vocab_dim)
+        probas = torch.softmax(input=logits, dim=-1)
+        next_token_id = torch.argmax(input=probas, dim=-1, keepdim=True)    #Output SHape:(batch, 1)
+
+        input_idx = torch.cat(tensors=[input_idx, next_token_id], dim=-1)  #Input: cat[(batch, num_tokens), (batch, 1), dim=-1] ; Output Shape: (batch, num_tokens + 1)
+
+
+    return  input_idx
+
+
+#TopK, Temperature, Multinomial Implementation in the advanced generate_text function.
+def generate_text_advance(model, idx, max_new_tokens, context_length, temperature=0, top_k=None,  eos_id=None):
+    '''Function to Generate Advanced Token Generation Strategies.'''
+
+    for _ in range(max_new_tokens) :
+        with torch.no_grad():
+            idx = idx[:,-context_length:]            #input_idx Shape:(batch, num_tokens)  Convert to Shape:(batch, context_length)
+            logits = model(idx)                        #logits Shape:(batch,num_tokens, vocab_dim)
+            logits = logits[:, -1, :]                   #logits Shape:(batch, vocab_dim)  If you want (batch, 1,vocab_dim) use a slice logits[:, -1:, :] as with index it only return that element and slice an iterable.
+
+        #Extract top_k.
+        if top_k is not None:
+            #Filters logits with top_k sampling
+            top_k_logits, top_k_pos = torch.topk(input=logits, k=top_k)  #torch.topk() can handle batch of inputs and for each input it seprately does topk. #Output Shape:(batch, top_k)
+            min_val = top_k_logits[:,-1]
+            logits = torch.where(
+                condition = logits < min_val,     #For each row in batch taking the minimum element 
+                input = torch.tensor(float('-inf')).to(logits.device),
+                other = logits
+            )
+        if temperature > 0:
+            logits = logits / temperature
+            probas = torch.softmax(logits, dim=-1)              
+            next_idx = torch.multinomial(input=probas, num_samples=1)       #Shape:(batch, 1) So for a batch of sequences (batch, num_tokens) given this is the batch_output.
+        
+        else:
+            #Carries out greedy nexttoken selection as before when temperature scaling is disabled
+            probas = torch.softmax(logits, dim=-1)
+            next_idx = torch.argmax(input=probas, dim=-1)
+
+        #Stops generating early if end-of-sequence token is encountered
+        if next_idx == eos_id: #If EOS Token Id matches our next_token_id then exit generating sequences.
+            break
+
+        idx = torch.cat(tensors=[idx, next_idx], dim=-1)   #Input Shapes: (batch, num_tokens) & (bathc, 1) -> Output SHape: (batch, num_tokens+1)
+
+    return  idx
+
     
+
 
 
 
