@@ -1,4 +1,3 @@
-
 import numpy as np
 import pandas as pd
 import torch
@@ -8,15 +7,8 @@ from torch.utils.data import Dataset, DataLoader
 
 
 '''
-This File has Two types of KV Cache Implementation 
 
-1. 1st one is Naive / Simple KV Ccahing.
- Caveat : This implementation has one major Caveat which is if the input_sequence is equal to context_size of model or during KV Caching
-    the context size is filled since we are already have the KV cached so this one doesn't work at all.
-    For this problem we need to use a window size like rolling KV Cache Mechanism.
-
-2. 2nd One is Rolling Window based KV Caching where we take the latest context size length for KV Caching of Previous Tokens.
-Note: This one hasn't been implemented yet.
+This Script contains Group-Query Attention Implementation on GPT-2 Architecture along with Naive KV Cache.
 
 '''
 
@@ -31,6 +23,7 @@ GPT_CONFIG_124M = {
     "emb_dim": 768, # Embedding dimension
     "n_heads": 12, # Number of attention heads
     "n_layers": 12, # Number of layers i.e specifies the number of Transformer blocks in the model
+    'num_kv_groups': 3, 
     "drop_rate": 0.1, # Dropout rate
     "qkv_bias": False # Query-Key-Value bias
 }
@@ -138,162 +131,204 @@ class LayerNorm(nn.Module):
 
 
 
-#Naive/Simple KV Cache Implementation in MultiHeadAttention.
-class MultiHeadAttentionCachedSimple(nn.Module):
-    '''Class Implementation of KV Cache in MHA.
 
-    A. Caveat : This implementation has one major Caveat which is if the input_sequence is equal to context_size of model or during KV Caching
-        the context size is filled since we are already have the KV cached so this one doesn't work at all.
-        For this problem we need to use a window size like rolling KV Cache Mechanism.
+#Simple/Naive KV Cache Based Grouped Query Attention Implementation.
+class GroupedQueryAttentionCachedSimple(nn.Module):
+    '''Class Implementation of Grouped Query Attention along with KV Cache.
+    Note: This One has used Modified Causal Masking Techniques & Also Two Types of Grouped Attention Calculation strategy has been shown here.'''
 
-    KV Cache Storing :
-
-    Concretely, after the cache is initialized via the if self.cache_k is None: ..., we add 
-    the newly generated keys and values via self.cache_k = torch.cat(...) and self.cache_v = torch.cat(...) to the cache, respectively.
-    
-    Retrieving
-
-    Then, keys, values = self.cache_k, self.cache_v retrieves the stored values and keys from the cache.
-    
-    '''
-
-    def __init__(self, d_in, d_out, context_length, num_heads, dropout=0.1, qkv_bias=False):
+    def __init__(self, d_in, d_out, context_length, num_heads, num_kv_groups, dropout=0.1, qkv_bias=False, dtype=None):
         super().__init__()
 
+        device = 'cpu'
+
         assert d_out % num_heads == 0, 'd_out must be divisible by num_heads'
-        self.head_dim = d_out // num_heads
-        self.num_heads = num_heads
-        self.d_in, self.d_out, self.context_length = d_in, d_out, context_length
+        assert num_heads % num_kv_groups == 0, 'num_heads must be divisible by num_kv_groups'
 
-        self.W_q = nn.Linear(in_features=d_in, out_features=d_out, bias=qkv_bias)
-        self.W_k = nn.Linear(in_features=d_in, out_features=d_out, bias=qkv_bias)
-        self.W_v = nn.Linear(in_features=d_in, out_features=d_out, bias=qkv_bias)
+        self.head_dim, self.num_heads, self.context_length = d_out // num_heads, num_heads, context_length
+        self.num_kv_groups = num_kv_groups
+        self.d_in, self.d_out = d_in, d_out
 
+        self.W_q = nn.Linear(in_features=d_in, out_features=d_out, bias=qkv_bias, device=device, dtype=dtype)  
+
+        #For W_k &W_v matrices we output_dim is not d_out rather it is (self.num_kv_groups * self.head_dim) 
+        #The reason for that is we need to calculate the attn_weights by matrix multiplication based on Query's head_dim & Key's head_dim.
+        #So we keep the same head_dim but variable no. of key, value groups.
+        #Because if we did kv_dim = d_out // num_kv_groups we would not be able to matrix multiply Query & Value vectors as their embed_dim would be different.
+        self.W_k = nn.Linear(d_in, num_kv_groups*self.head_dim, bias=qkv_bias, device=device, dtype=dtype)
+        self.W_v = nn.Linear(d_in, num_kv_groups*self.head_dim, bias=qkv_bias, device=device, dtype=dtype)
+        #The following line gives how many heads per Key, Value Pair or how many heads per KV pair.
+        self.group_size = self.num_heads // num_kv_groups
+
+        self.dropout = nn.Dropout(p=dropout)  #This dropout is used in attention weight dropping during training.
+        self.out_proj = nn.Linear(in_features=d_out, out_features=d_out, bias=None, device=device, dtype=dtype)
+
+        #Note: Here we haven't used a register buffer for causal_mask as we will use different more robust implementation of Causal Masking in forward.
         self.register_buffer(
-            name='mask',
-            tensor=torch.triu(input=torch.ones(size=(context_length, context_length)), diagonal=1),
+            name='k_cache',
+            tensor=None,
             persistent=False
         )
-
-        self.dropout = nn.Dropout(dropout)
-        self.out_proj = nn.Linear(in_features=d_out, out_features=d_out)
-
-        #Newly added components for KV Cache.
-        #Since KV Cache is used only in LLM generation/Serving/Inference Mode so we dont make it part of the model itself
-        #that's why the tensor for it is not a persistent one.
         self.register_buffer(
-                    name='k_cache',
-                    tensor=None,
-                    persistent=False
-                )
-        self.register_buffer(
-                            name='v_cache',
-                            tensor=None,
-                            persistent=False
-                        )
-        #Added to keep track of which position token for we are decoding / generating.
-        #This is a simple counter that remembers how many tokens the model has already cached during an incremental generation session.
-        self.ptr_current_pos = 0
+            name='v_cache',
+            tensor=None,
+            persistent=False
+        )
+        #This one is used in KV Caching to track number of Cached Tokens.
+        self.ptr_current_pos = 0  
 
 
-    def forward(self, x, kv_cache=False):  #KV Cache is used during the forward pass only.
+    def forward(self, x, kv_cache=False):
 
-        #x or input is of shape (batch_size, seq_length, d_in)
-        #Note: If kv_cache=True then num_tokens is num_new_tokens.
         batch_size, num_tokens, d_in = x.shape
 
-        #If kv_cache=True then Q, K_new, V_new size is (batch_size, new_seq_length, d_out)
-        Q, K_new, V_new = self.W_q(x), self.W_k(x), self.W_v(x)  # create (batch_size, seq_length, d_in) ->(batch_size, seq_length, d_out)
-        # Unroll last dim: (b, num_tokens, d_out) -> (b, num_tokens, num_heads, head_dim)
-        Q = Q.view(batch_size, num_tokens, self.num_heads, self.head_dim)
-        K_new = K_new.view(batch_size, num_tokens, self.num_heads, self.head_dim)
-        V_new = V_new.view(batch_size, num_tokens, self.num_heads, self.head_dim)
+        Q = self.W_q(x)  #Output SHape:(batch_size, num_tokens, d_out) or if kv_cache enabled then (batch_size, Q_num_tokens, d_out)
+        K_new = self.W_k(x) #Output Shape:(batch_size, num_tokens, num_kv_groups*self.head_dim) or if kv_cache enabled then (batch_size, K_num_tokens, num_kv_groups*self.head_dim)
+        V_new = self.W_v(x) #Output Shape:(batch_size, num_tokens, num_kv_groups*self.head_dim)
 
+        #Let's Reshape.
+        #Breaking d_out into (num_heads, head_dim) & transposing num_token, num_heads in same line.
+        #Output Shape:(batch_size, num_heads, num_tokens, head_dim)
+        Q = Q.view(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1,2) 
+        #Breaking Key & Value Tensors into (self.num_kv_groups, self.head_dim) & transposing num_token, num_kv_groups in same line.
+        K_new = K_new.view(batch_size, num_tokens, self.num_kv_groups, self.head_dim).transpose(1,2) 
+        V_new = V_new.view(batch_size, num_tokens, self.num_kv_groups, self.head_dim).transpose(1,2) 
 
-        ## Newly added KV Cache Part.
-        #If we use KV cache we can only pass new tokens and the older tokens will be stored in KV cache format as an atribute of the attn class.
-        #As we are passing only new tokens so only new queries will be there.
         if kv_cache:
             # pass
             if self.k_cache is None or self.v_cache is None:
                 # pass
                 self.k_cache, self.v_cache = K_new, V_new
             else:
-                #(batch_size, newly_added_seq_length, d_out) --> (batch_size, kv_cached_seq_length + newly_added_seq_length, d_out)
-                self.k_cache, self.v_cache = torch.cat([self.k_cache, K_new], dim=1), torch.cat([self.v_cache, V_new], dim=1) #Concating along the num_tokens_dim
+                K = torch.cat(tensors=[self.k_cache, K_new], dim=2)  #Concating along the num_tokens dimension
+                V = torch.cat(tensors=[self.v_cache, V_new], dim=2)
+            #Updating the KV Cache with new tokens.
             #Once we have got the old Keys & Values concatenated withnew Ones now time for Attention Calculation.
             K, V = self.k_cache, self.v_cache
         else:
-            #If no KV cache then we need to pass all tokens everytime to the model .
+            #As we are not using KV Cache so we can directly assign.
             K, V = K_new, V_new
 
+        ####### Newly Modified Part for Grouped Query ATtention #####
+        #Checkout torch.tensor.repeat_interleave(): https://docs.pytorch.org/docs/2.14/generated/torch.repeat_interleave.html
+        # Expanding keys and values to match the number of heads
+        #Since we have Query dim=1 as self.num_heads So to copy the Key & Value tensors as same size so we have to do this.
+        #Input Shape:(batch, num_kv_groups, K_num_tokens, head_dim)  --> Output Shape:(batch, num_heads, K_num_tokens, head_dim)
+        K = K.repeat_interleave(repeats=self.group_size, dim=1)  
+        V = V.repeat_interleave(repeats=self.group_size, dim=1)
+        # For example, before repeat_interleave along dim=1 (query groups):
+        #   [K1, K2]
+        # After repeat_interleave (each query group is repeated group_size times):
+        #   [K1, K1, K2, K2]
+        # If we used regular repeat instead of repeat_interleave, we'd get:
+        #   [K1, K2, K1, K2]
 
-        #Now we need to change calculate Attention for each block separately so first we have to interchange the num_tokens & num_heads place.
-        Q, K, V = Q.transpose(1,2), K.transpose(1,2), V.transpose(1,2)  #Shape Output: (batch_size, num_heads,  num_tokens, head_dim)
+        #Note: Instead of using repeat_interleave we can use broadcasting in pytorch.
+        #Broadcasting Method for Attention (Alternative): 
+        # Q.view(batch_size, self.num_kv_groups, self.group_size, Q_num_tokens, self.head_dim) @ K.view(batch_size, self.num_kv_groups, 1, K_num_tokens, self.head_dim).transpose(2,3)
 
-        #If kv_cache == False : #Output Shape: (batch_size, num_heads,  seq_length, seq_length)
-        #If kv_cache == True : #Output Shape: (batch_size, num_heads,  Q_num_tokens, K_num_tokens), so if we generate 1 token and pass 1 token then #Output Shape: (batch_size, num_heads,  1, K_num_tokens)
-        #As we may generate 1 token at a time with only one newly added token each time, then we have to attend to each and every previous token than this new one.
-        attn_scores = Q @ K.transpose(2,3)  #Output Shape (batch_size, num_heads,  Q_num_tokens, K_num_tokens)
+        #Scaled dot product Attention.
+        attn_scores = Q @ K.transpose(2,3)   #Output Shape:(batch, num_heads, Q_num_tokens, K_num_tokens)
+        #Q_num_tokens is the number of query tokens & K_num_tokens is the cached+new set of tokens.
 
 
-        ############ Newly modified part in Causal Masking for KV cache . ############
-        #Older Masking across whole Tokens.
-        # attn_scores.masked_fill_(
-        #     self.mask.bool()[:num_tokens, :num_tokens], -torch.inf
-        # )
-        #Here we are using the track keeping flag to do masking from 2th position to 5th position if we are decoding from 2 th position to 5th position.
-        Q_num_tokens, K_num_tokens = Q.shape[-2], K.shape[-2] #Q/K shape:(batch_size, num_heads,  Q/K_num_tokens, head_dim)
-
-        if kv_cache :
-            mask_bool = self.mask.bool()[self.ptr_current_pos:self.ptr_current_pos + Q_num_tokens, : K_num_tokens]
-            #Keeping track of last updated postions of the tokens.
-            self.ptr_current_pos += Q_num_tokens
+        ######## Newly Modified Causal Masking After Attention Score Calculation. ##########
+        #Alternative & Better Robust way to Calculate Causal Masking when Query_length & Total Ccahed Key, Value length is different.
+        num_tokens_Q = Q.shape[-2]
+        num_tokens_K = K.shape[-2]
+        device = Q.device
+        if kv_cache:
+            # pass
+            #Output SHape:(num_tokens_Q,)
+            Q_positions = torch.arange(
+                start = self.ptr_current_pos,
+                end= self.ptr_current_pos + num_tokens_Q,
+                dtype=None,
+                device=device
+            )
+            #Update the tracking variable till latest cached num_tokens.
+            self.ptr_current_pos += num_tokens_Q
         else:
-            mask_bool = self.mask.bool()[:Q_num_tokens, :K_num_tokens]
+            #Output SHape:(num_tokens_Q,)
+            Q_positions = torch.arange(
+                end= self.ptr_current_pos + num_tokens_Q,
+                dtype=None,
+                device=device
+            )
+            self.ptr_current_pos = 0  #As in this case no KV Cache stored so points to zero.
+            #Output SHape:(num_tokens_K,)
+        K_positions = torch.arange(end=num_tokens_K, dtype=None, device=device)
 
+        #### ALternative Masking Dynamically unlike creating static Upper Triangular Matrices.
+        # [[num_tokens_Q],] i.e (num_tokens_Q, 1) < [1, [num_tokens_K]] i.e (1, num_tokens_K) --> Gives Matrix of (num_tokens_Q, num_tokens_K)
+        #This happens as a result of broadcasting in Pytorch.
+        mask = Q_positions.unsqueeze(-1) < K_positions.unsqueeze(0)  
 
-        attn_scores.masked_fill_(mask_bool, -torch.inf)
+        #Example:
+        '''
+        Suppose : Q_positions = [5, 6, 7] (Shape:(3,) or [3]) & K_positions = [0,1,2,3,4,5,6,7]    shape [8]
+        So Q_positions.unsqueeze(-1) = [[5],[6],[7]] (Shape:(3,1)) & K_positions.unsqueeze(0) = [[0,1,2,3,4,5,6,7]] (Shape:((1,8)))
+        And comparing (3,1) & (1,8) allowed broadcasting so became a matrix of shape:(3,8)
+                   
+            Q            K →
+            ↓   0  1  2  3  4  5  6  7
+            5   5   5  5  5  5  5  5  5  
+            6   6  6  6  6  6  6  6  6
+            7   7  7  7  7  7  7  7  7
+                ↓
+                compare
+        
+        Hence since Q_pos & K_pos were positional indices so for position 5 we cant calculate Attention beyond 5 so it should be False mask from 5 to 7 and so on.
+        So the comparison becomes:
 
+            5 < [0,1,2,3,4,5,6,7]
+            6 < [0,1,2,3,4,5,6,7]
+            7 < [0,1,2,3,4,5,6,7]
 
-        attn_weights = torch.softmax(attn_scores/(K.shape[-1]**0.5), dim=-1)  #(batch_size, num_heads,  num_tokens , num_tokens)
-        attn_weights = self.dropout(attn_weights)
+        giving:
 
-        context_vectors = attn_weights @ V  #Output Shape: (batch_size, num_heads,  num_tokens, head_dim)
-        #Reversing the position of num_heads & num_tokens
-        context_vectors =  context_vectors.transpose(1,2)  #Output Shape: (batch_size, num_tokens, num_heads, head_dim)
+            [[False, False, False, False, False, False, True,  True ],
+            [False, False, False, False, False, False, False, True ],
+            [False, False, False, False, False, False, False, False]]
+        
+        '''
 
-        #Now we need to make the current context_vector shape memory contiguus and then couple the num_heads & head_dim into one.
+        attn_scores.masked_fill_(mask, -torch.inf)
 
-        context_vectors = context_vectors.contiguous().view(batch_size, num_tokens, self.d_out)  #Merged the num_heads & head_dim into d_out.
+        assert K.shape[-1] == self.head_dim, 'K embedding dim should be same as Each Head Embedding Dimension'
+        attn_weights = torch.softmax(input=attn_scores / K.shape[-1]**0.5, dim=-1) #Output Shape :(batch, num_heads, Q_num_tokens, K_num_tokens)
 
+        #Since Keys & Values are of same dim i.e K_num_tokens = V_num_tokens
+        #(batch, num_heads, Q_num_tokens, K_num_tokens) @ (batch, num_heads, V_num_tokens, head_dim) --> (batch, num_heads, Q_num_tokens, head_dim)
+        context_vectors = attn_weights @ V 
+        context_vectors = context_vectors.transpose(1,2)    #Output Shape:(batch, Q_num_tokens, num_heads, head_dim)
+
+         # Combine heads, where self.d_out = self.num_heads * self.head_dim
+        context_vectors = context_vectors.contiguous().view(batch_size, num_tokens, self.d_out)
         context_vectors = self.out_proj(context_vectors)
-        return context_vectors
+
+        return  context_vectors
 
     def reset_cache(self):
-        '''Function to reset the KV Cache Storage & Pointer to the Latest Tokens.
-        
-        When generating text, we have to remember to reset both the keys and value buffers between two separate text-generation calls. 
-        Otherwise, the queries of a new prompt will attend to stale keys left over from the previous sequence, which causes the model to 
-        rely on irrelevant context and produce incoherent output. To prevent this, we add a reset_kv_cache method to the MultiHeadAttention Block.
-        '''
-        
-        self.k_cache, self.v_cache = None, None
+        self.cache_k, self.cache_v = None, None
         self.ptr_current_pos = 0
 
 
 
+
+
 #Naive/Simple KV Cache Implementation on Transformer Block.
-class TransformerBlockCachedSimple(nn.Module):
+class TransformerBlockGQACachedSimple(nn.Module):
 
     def __init__(self, cfg):
         super().__int__()
 
-        self.attn = MultiHeadAttentionCachedSimple(
+        self.attn = GroupedQueryAttentionCachedSimple(
             d_in = cfg['emb_dim'],
             d_out = cfg['emb_dim'],
             context_length = cfg['context_length'],
             num_heads = cfg['n_heads'],
+            num_kv_groups = cfg['num_kv_groups'],
             dropout = 0.1,
             qkv_bias = cfg['qkv_bias']
         )
@@ -329,8 +364,8 @@ class TransformerBlockCachedSimple(nn.Module):
 
 
 
-#Gpt Model Class KV Cache Implementation.
-class GPTModelCachedSimple(nn.Module):
+#Gpt Model Class with GQA & Naive KV Cache Implementation.
+class GPTModelGQACachedSimple(nn.Module):
     '''KV Cache Implementation GPT Model Class.
     A. Caveat : This implementation has one major Caveat which is if the input_sequence is equal to context_size of model or during KV Caching
         the context size is filled since we are already have the KV cached so this one doesn't work at all.
@@ -348,7 +383,7 @@ class GPTModelCachedSimple(nn.Module):
         #             *[TransformerBlock(cfg) for _ in range(cfg['n_layers'])]
         #         )
         self.trf_blocks = nn.ModuleList(
-            [TransformerBlockCachedSimple(cfg) for _ in range(cfg['n_layers'])]
+            [TransformerBlockGQACachedSimple(cfg) for _ in range(cfg['n_layers'])]
         )
 
         #We also need a Position Counter here as well for tracking for many tokens have been cached.
@@ -444,8 +479,6 @@ def generate_text_greedy_cached_simple(model, idx, context_length, max_new_token
         
 
     return  idx
-
-
 
 
 
