@@ -6,6 +6,20 @@ import tiktoken
 from torch.utils.data import Dataset, DataLoader
 
 
+
+#Test GPT2 Configuration.
+#GPT Configuration.
+GPT_CONFIG_124M = {
+    "vocab_size": 50257, # Vocabulary size
+    "context_length": 256, # Context length  #Change to 256 from 1024 for Learning
+    "emb_dim": 768, # Embedding dimension
+    "n_heads": 12, # Number of attention heads
+    "n_layers": 12, # Number of layers i.e specifies the number of Transformer blocks in the model
+    "drop_rate": 0.1, # Dropout rate
+    "qkv_bias": False # Query-Key-Value bias
+}
+
+
 #Data Processing Code Components.
 
 class GPTDataset_V1(Dataset):

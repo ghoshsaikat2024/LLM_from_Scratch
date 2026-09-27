@@ -7,6 +7,36 @@ import tiktoken
 from torch.utils.data import Dataset, DataLoader
 
 
+'''
+This File has Two types of KV Cache Implementation 
+
+1. 1st one is Naive / Simple KV Ccahing.
+ Caveat : This implementation has one major Caveat which is if the input_sequence is equal to context_size of model or during KV Caching
+    the context size is filled since we are already have the KV cached so this one doesn't work at all.
+    For this problem we need to use a window size like rolling KV Cache Mechanism.
+
+2. 2nd One is Rolling Window based KV Caching where we take the latest context size length for KV Caching of Previous Tokens.
+Note: This one hasn't been implemented yet.
+
+'''
+
+
+
+
+#Test GPT2 Configuration.
+#GPT2 Configuration.
+GPT_CONFIG_124M = {
+    "vocab_size": 50257, # Vocabulary size
+    "context_length": 256, # Context length  #Change to 256 from 1024 for Learning
+    "emb_dim": 768, # Embedding dimension
+    "n_heads": 12, # Number of attention heads
+    "n_layers": 12, # Number of layers i.e specifies the number of Transformer blocks in the model
+    "drop_rate": 0.1, # Dropout rate
+    "qkv_bias": False # Query-Key-Value bias
+}
+
+
+
 #Data Processing Code Components.
 
 class GPTDataset_V1(Dataset):
@@ -108,19 +138,32 @@ class LayerNorm(nn.Module):
 
 
 
+#Naive/Simple KV Cache Implementation in MultiHeadAttention.
+class MultiHeadAttentionCachedSimple(nn.Module):
+    '''Class Implementation of KV Cache in MHA.
 
+    A. Caveat : This implementation has one major Caveat which is if the input_sequence is equal to context_size of model or during KV Caching
+        the context size is filled since we are already have the KV cached so this one doesn't work at all.
+        For this problem we need to use a window size like rolling KV Cache Mechanism.
 
-class MultiHeadAttentionCached(nn.Module):
-    '''Class Implementation of KV Cache in MHA.'''
+    KV Cache Storing :
 
-    def __init__(self, d_in, d_out, context_length, num_heads, dropout=0.1, qkv_bias=False, kv_cache=False):
+    Concretely, after the cache is initialized via the if self.cache_k is None: ..., we add 
+    the newly generated keys and values via self.cache_k = torch.cat(...) and self.cache_v = torch.cat(...) to the cache, respectively.
+    
+    Retrieving
+
+    Then, keys, values = self.cache_k, self.cache_v retrieves the stored values and keys from the cache.
+    
+    '''
+
+    def __init__(self, d_in, d_out, context_length, num_heads, dropout=0.1, qkv_bias=False):
         super().__init__()
 
         assert d_out % num_heads == 0, 'd_out must be divisible by num_heads'
         self.head_dim = d_out // num_heads
         self.num_heads = num_heads
         self.d_in, self.d_out, self.context_length = d_in, d_out, context_length
-        self.kv_cache = kv_cache
 
         self.W_q = nn.Linear(in_features=d_in, out_features=d_out, bias=qkv_bias)
         self.W_k = nn.Linear(in_features=d_in, out_features=d_out, bias=qkv_bias)
@@ -136,6 +179,8 @@ class MultiHeadAttentionCached(nn.Module):
         self.out_proj = nn.Linear(in_features=d_out, out_features=d_out)
 
         #Newly added components for KV Cache.
+        #Since KV Cache is used only in LLM generation/Serving/Inference Mode so we dont make it part of the model itself
+        #that's why the tensor for it is not a persistent one.
         self.register_buffer(
                     name='k_cache',
                     tensor=None,
@@ -147,10 +192,11 @@ class MultiHeadAttentionCached(nn.Module):
                             persistent=False
                         )
         #Added to keep track of which position token for we are decoding / generating.
+        #This is a simple counter that remembers how many tokens the model has already cached during an incremental generation session.
         self.ptr_current_pos = 0
 
 
-    def forward(self, x):
+    def forward(self, x, kv_cache=False):  #KV Cache is used during the forward pass only.
 
         #x or input is of shape (batch_size, seq_length, d_in)
         #Note: If kv_cache=True then num_tokens is num_new_tokens.
@@ -165,9 +211,9 @@ class MultiHeadAttentionCached(nn.Module):
 
 
         ## Newly added KV Cache Part.
-        #If we use KV cache we can only pass new tokens and the older tokens will be stored in KV cache format.
+        #If we use KV cache we can only pass new tokens and the older tokens will be stored in KV cache format as an atribute of the attn class.
         #As we are passing only new tokens so only new queries will be there.
-        if self.kv_cache:
+        if kv_cache:
             # pass
             if self.k_cache == None:
                 self.k_cache, self.v_cache = K_new, V_new
@@ -187,10 +233,10 @@ class MultiHeadAttentionCached(nn.Module):
         #If kv_cache == False : #Output Shape: (batch_size, num_heads,  seq_length, seq_length)
         #If kv_cache == True : #Output Shape: (batch_size, num_heads,  Q_num_tokens, K_num_tokens), so if we generate 1 token and pass 1 token then #Output Shape: (batch_size, num_heads,  1, K_num_tokens)
         #As we may generate 1 token at a time with only one newly added token each time, then we have to attend to each and every previous token than this new one.
-        attn_scores = Q @ K.transpose(2,3)  
+        attn_scores = Q @ K.transpose(2,3)  #Output Shape (batch_size, num_heads,  Q_num_tokens, K_num_tokens)
 
 
-        ##Newly modified part in Causal Masking for KV cache .
+        ############ Newly modified part in Causal Masking for KV cache . ############
         #Older Masking across whole Tokens.
         # attn_scores.masked_fill_(
         #     self.mask.bool()[:num_tokens, :num_tokens], -torch.inf
@@ -198,7 +244,7 @@ class MultiHeadAttentionCached(nn.Module):
         #Here we are using the track keeping flag to do masking from 2th position to 5th position if we are decoding from 2 th position to 5th position.
         Q_num_tokens, K_num_tokens = Q.shape[-2], K.shape[-2] #Q/K shape:(batch_size, num_heads,  Q/K_num_tokens, head_dim)
 
-        if self.kv_cache :
+        if kv_cache :
             mask_bool = self.mask.bool()[self.ptr_current_pos:self.ptr_current_pos + Q_num_tokens, : K_num_tokens]
             #Keeping track of last updated postions of the tokens.
             self.ptr_current_pos += Q_num_tokens
@@ -224,10 +270,179 @@ class MultiHeadAttentionCached(nn.Module):
         return context_vectors
 
     def reset_cache(self):
-        '''Function to reset the KV Cache Storage.'''
+        '''Function to reset the KV Cache Storage & Pointer to the Latest Tokens.
+        
+        When generating text, we have to remember to reset both the keys and value buffers between two separate text-generation calls. 
+        Otherwise, the queries of a new prompt will attend to stale keys left over from the previous sequence, which causes the model to 
+        rely on irrelevant context and produce incoherent output. To prevent this, we add a reset_kv_cache method to the MultiHeadAttention Block.
+        '''
+        
         self.k_cache, self.v_cache = None, None
         self.ptr_current_pos = 0
 
+
+
+#Naive/Simple KV Cache Implementation on Transformer Block.
+class TransformerBlockCachedSimple(nn.Module):
+
+    def __init__(self, cfg):
+        super().__int__()
+
+        self.attn = MultiHeadAttentionCachedSimple(
+            d_in = cfg['emb_dim'],
+            d_out = cfg['emb_dim'],
+            context_length = cfg['context_length'],
+            num_heads = cfg['n_heads'],
+            dropout = 0.1,
+            qkv_bias = cfg['qkv_bias']
+        )
+        self.ffn = FeedForward(cfg=cfg)
+        self.norm1 = LayerNorm(embed_dim=cfg['emb_dim'])
+        self.norm2 = LayerNorm(embed_dim=cfg['emb_dim'])
+
+        self.dropout = nn.Dropout(p=cfg['drop_rate'])
+
+
+    def forward(self, x, kv_cache=False):
+
+        # Shortcut connection for attention block
+        shortcut = x #Skip Connection.
+
+        x = self.norm1(x)
+        #Newly modified kv cache line during forward pass
+        x = self.attn(x, kv_cache=kv_cache)
+        x = self.dropout(x)
+
+        #Adding shortcut/skip connection.
+        x = x+shortcut
+
+        ## SHortcut connection for FFN block
+        shortcut = x
+        x = self.norm2(x)
+        x = self.ffn(x)
+        x = self.dropout(x)
+
+        x = x + shortcut
+
+        return  x
+
+
+
+#Gpt Model Class KV Cache Implementation.
+class GPTModelCachedSimple(nn.Module):
+    '''KV Cache Implementation GPT Model Class.
+    A. Caveat : This implementation has one major Caveat which is if the input_sequence is equal to context_size of model or during KV Caching
+        the context size is filled since we are already have the KV cached so this one doesn't work at all.
+        For this problem we need to use a window size like rolling KV Cache Mechanism.
+    '''
+
+    def __init__(self, cfg):
+        super().__init__()
+
+        self.token_emb = nn.Embedding(num_embeddings=cfg['vocab_size'], embedding_dim=cfg['emb_dim'])
+        self.pos_emb = nn.Embedding(num_embeddings=cfg['context_length'], embedding_dim=cfg['emb_dim'])
+
+        ## Newly Modified one after KV Cache.
+        # self.trf_blocks = nn.Sequential(
+        #             *[TransformerBlock(cfg) for _ in range(cfg['n_layers'])]
+        #         )
+        self.trf_blocks = nn.ModuleList(
+            [TransformerBlockCachedSimple(cfg) for _ in range(cfg['n_layers'])]
+        )
+
+        #We also need a Position Counter here as well for tracking for many tokens have been cached.
+        self.ptr_current_pos = 0
+
+        self.final_norm = LayerNorm(embed_dim=cfg['emb_dim'])
+        self.dropout = nn.Dropout(p=cfg['drop_rate'])
+        self.out_head = nn.Linear(in_features=cfg['emb_dim'], out_features=cfg['vocab_size'], bias=False)
+
+    def forward(self, in_idx, kv_cache=False):
+
+        batch_size, seq_len = in_idx.shape
+
+        token_emb = self.token_emb(in_idx)    #(batch_size,seq_length, embed_dim)
+
+        #Newly Modified Part.
+        if kv_cache:
+            pos_ids = torch.arange(start=self.ptr_current_pos, end=self.ptr_current_pos+seq_len, device=in_idx.device, dtype=torch.long)
+
+        else:
+            pos_ids = torch.arange(start=0, end=seq_len, device=in_idx.device, dtype=torch.long) #Shape(seq_length,)
+
+        #Shape(seq_length,embed_dim) -> (1, seq_length, embed_dim) SO now we can add this with the toke_emb using broadcasting which is of size :(batch_size,seq_length, embed_dim)
+        pos_emb = self.pos_emb(pos_ids).unsqueeze(0)   #
+
+        x = token_emb + pos_emb
+        x = self.drop_emb(x)
+
+        #Passing through n_layers of Transformer Blocks.
+        for trf in self.trf_blocks:
+            x = trf(x, kv_cache=kv_cache)
+
+        x = self.final_norm(x)
+        logits = self.out_head(x)
+        return logits
+
+    #Now we add one extra method like we did in Attention Class to reset KV cache across all Transformer Blocks.
+    def reset_kv_cache(self):
+        '''During Generation we call this method at starting of each sequence generation so for each sequence token generation we dont have to pass
+             the whole previous sequence rather only the new token only.
+            ANd also to make sure each sequence is independently generated we flush the KV Cache while processing each new sequence.'''
+        for trf in self.trf_blocks:
+            trf.attn.reset_cache()
+        self.ptr_current_pos = 0
+
+
+
+
+#Greedy Style Text Deoing with Simle KV Cache.
+def generate_text_greedy_cached_simple(model, idx, context_length, max_new_tokens, kv_cache=True):
+
+    '''KV Cache Implementation on Greedy Decoding.
+    Note:
+
+    A. Caveat : This implementation has one major Caveat which is if the input_sequence is equal to context_size of model or during KV Caching
+    the context size is filled since we are already have the KV cached so this one doesn't work at all.
+    For this problem we need to use a window size like rolling KV Cache Mechanism.
+    '''
+
+    model.eval()
+    with torch.no_grad() :
+
+        if kv_cache:
+            # pass
+            # Init cache with full prompt
+            model.reset_kv_cache()
+            #Input Shape:(batch, seq_len)
+            idx = idx[:, -context_length:] 
+            logits = model(idx, kv_cache=kv_cache)
+
+            for _ in range(max_new_tokens):
+                #  logits = logits[:, -1, :]  #One can also equivalently write : logits[:, -1] means the same thing
+                next_idx = logits[:, -1].argmax(dim=-1, keepdim=True)  #Another way to write things
+                 # b) append it to the running sequence
+                idx = torch.cat([idx, next_idx], dim=1)
+                ## c) feed model only the new token
+                logits = model(next_idx, kv_cache=True)
+
+
+
+        else:
+            for _ in range(max_new_tokens):
+                #Input Shape:(batch, seq_len)
+                idx = idx[:, -context_length:] 
+                logits = model(idx, kv_cache=False)  ##Output Shape:(batch, seq_len, vocab_dim)
+            
+                logits = logits[:, -1, :]           ##Output Shape:(batch, 1, vocab_dim)
+                #Using Greedy decoding for only the max logit value.
+                idx_next = torch.argmax(input=logits, dim=-1, keepdim=True)   #Output Shape:(batch, 1)
+
+                idx = torch.cat(tensors=[idx, idx_next], dim=-1) ## (batch, n_tokens+1)
+        
+        
+
+    return  idx
 
 
 
