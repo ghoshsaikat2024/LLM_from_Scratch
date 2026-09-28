@@ -133,7 +133,7 @@ class LayerNorm(nn.Module):
 
 
 
-class MultiHeadLatentAttention(nn.Module):
+class MultiHeadLatentAttentionCachedSimple(nn.Module):
 
 
     def __init__(self, d_in, d_out, context_length, num_heads, dropout, latent_dim, qkv_bias=False, dtype=None):
@@ -259,7 +259,7 @@ class TransformerBlockMLACachedSimple(nn.Module):
     def __init__(self, cfg):
         super().__int__()
 
-        self.attn = MultiHeadLatentAttention(
+        self.attn = MultiHeadLatentAttentionCachedSimple(
             d_in = cfg['emb_dim'],
             d_out = cfg['emb_dim'],
             context_length = cfg['context_length'],
