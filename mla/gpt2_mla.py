@@ -6,13 +6,13 @@ import tiktoken
 from torch.utils.data import Dataset, DataLoader
 
 
-'''
-
-This Script contains Group-Query Attention Implementation on GPT-2 Architecture along with Naive KV Cache.
 
 '''
-
-
+This Script contains MultiHead Latent Attention Implementation on GPT-2 Architecture along with Naive KV Cache.
+MLA instead of storing the Key , value Vectors of Matrix for batches stores a generalized latent small dimensional intermediate vectors /Matrix for unique token/batch tokens.
+Checkout this article for Resource on Multi Head Latent Attention: https://machinelearningmastery.com/a-gentle-introduction-to-multi-head-latent-attention-mla/
+Also Check out this Repo by Sebastian Raschka : https://github.com/rasbt/LLMs-from-scratch/tree/main/ch04/05_mla
+'''
 
 
 #Test GPT2 Configuration.
@@ -28,7 +28,6 @@ GPT_CONFIG_124M = {
     "drop_rate": 0.1, # Dropout rate
     "qkv_bias": False # Query-Key-Value bias
 }
-
 
 
 
@@ -134,203 +133,138 @@ class LayerNorm(nn.Module):
 
 
 
-#Simple/Naive KV Cache Based Grouped Query Attention Implementation.
-class GroupedQueryAttentionCachedSimple(nn.Module):
-    '''Class Implementation of Grouped Query Attention along with KV Cache.
-    Note: This One has used Modified Causal Masking Techniques & Also Two Types of Grouped Attention Calculation strategy has been shown here.'''
+class MultiHeadLatentAttention(nn.Module):
 
-    def __init__(self, d_in, d_out, context_length, num_heads, num_kv_groups, dropout=0.1, qkv_bias=False, dtype=None):
+
+    def __init__(self, d_in, d_out, context_length, num_heads, dropout, latent_dim, qkv_bias=False, dtype=None):
         super().__init__()
 
-        device = 'cpu'
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
         assert d_out % num_heads == 0, 'd_out must be divisible by num_heads'
-        assert num_heads % num_kv_groups == 0, 'num_heads must be divisible by num_kv_groups'
 
-        self.head_dim, self.num_heads, self.context_length = d_out // num_heads, num_heads, context_length
-        self.num_kv_groups = num_kv_groups
-        self.d_in, self.d_out = d_in, d_out
+        self.num_heads, self.head_dim = num_heads, d_out // num_heads
+        self.latent_dim = latent_dim if latent_dim is not None else max(16,d_out // num_heads)
+        self.d_in, self.d_out, self.context_length = d_in, d_out, context_length
 
-        self.W_q = nn.Linear(in_features=d_in, out_features=d_out, bias=qkv_bias, device=device, dtype=dtype)  
+        #Initializing the W_q matrix.
+        self.W_q = nn.Linear(in_features=d_in, out_features=d_out, qkv_bias=qkv_bias, device=device, dtype=dtype)
 
-        #For W_k &W_v matrices we output_dim is not d_out rather it is (self.num_kv_groups * self.head_dim) 
-        #The reason for that is we need to calculate the attn_weights by matrix multiplication based on Query's head_dim & Key's head_dim.
-        #So we keep the same head_dim but variable no. of key, value groups.
-        #Because if we did kv_dim = d_out // num_kv_groups we would not be able to matrix multiply Query & Value vectors as their embed_dim would be different.
-        self.W_k = nn.Linear(d_in, num_kv_groups*self.head_dim, bias=qkv_bias, device=device, dtype=dtype)
-        self.W_v = nn.Linear(d_in, num_kv_groups*self.head_dim, bias=qkv_bias, device=device, dtype=dtype)
-        #The following line gives how many heads per Key, Value Pair or how many heads per KV pair.
-        self.group_size = self.num_heads // num_kv_groups
+        #Initializing the Latent Downsampling Matrix & Also Upsampling Matrix as well.
+        self.W_kv = nn.Linear(in_features=d_in, out_features=latent_dim, qkv_bias=qkv_bias, device=device, dtype=dtype)
+        self.W_ku = nn.Linear(in_features=latent_dim, out_features=d_out, qkv_bias=qkv_bias, device=device, dtype=dtype)
+        self.W_vu = nn.Linear(in_features=latent_dim, out_features=d_out, qkv_bias=qkv_bias, device=device, dtype=dtype)
 
-        self.dropout = nn.Dropout(p=dropout)  #This dropout is used in attention weight dropping during training.
-        self.out_proj = nn.Linear(in_features=d_out, out_features=d_out, bias=None, device=device, dtype=dtype)
+        #Tracking Pointer to keep track of Cached latent C_kv vector .
+        self.ptr_current_pos = 0
 
-        #Note: Here we haven't used a register buffer for causal_mask as we will use different more robust implementation of Causal Masking in forward.
+        self.dropout = nn.Dropout(p=dropout)
+
+        self.out_proj = nn.Linear(in_features=d_out, out_features=d_out, qkv_bias=None, device=device, dtype=dtype)
+
+        #Creating the KV Cache tensor.
         self.register_buffer(
-            name='k_cache',
+            name='c_kv_cache',
             tensor=None,
-            persistent=False
+            persistent=False    #Since KV Cache is not part of Model so persistent memory is False.
         )
-        self.register_buffer(
-            name='v_cache',
-            tensor=None,
-            persistent=False
-        )
-        #This one is used in KV Caching to track number of Cached Tokens.
-        self.ptr_current_pos = 0  
+
 
 
     def forward(self, x, kv_cache=False):
 
-        batch_size, num_tokens, d_in = x.shape
+        batch_size, num_tokens, d_in = x.shape  #Shape:(batch, num_tokens, embed_dim)
 
-        Q = self.W_q(x)  #Output SHape:(batch_size, num_tokens, d_out) or if kv_cache enabled then (batch_size, Q_num_tokens, d_out)
-        K_new = self.W_k(x) #Output Shape:(batch_size, num_tokens, num_kv_groups*self.head_dim) or if kv_cache enabled then (batch_size, K_num_tokens, num_kv_groups*self.head_dim)
-        V_new = self.W_v(x) #Output Shape:(batch_size, num_tokens, num_kv_groups*self.head_dim)
+        Q = self.W_q(x)       #Output Shape:(batch, num_tokens, d_out)
+        #Now let's project the Input X to C_kv_latent vector.
+        #(batch, num_tokens, embed_dim) --> (batch, num_tokens, latent_dim)
+        C_kv_latent_new = self.W_kv(x)  
 
-        #Let's Reshape.
-        #Breaking d_out into (num_heads, head_dim) & transposing num_token, num_heads in same line.
-        #Output Shape:(batch_size, num_heads, num_tokens, head_dim)
-        Q = Q.view(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1,2) 
-        #Breaking Key & Value Tensors into (self.num_kv_groups, self.head_dim) & transposing num_token, num_kv_groups in same line.
-        K_new = K_new.view(batch_size, num_tokens, self.num_kv_groups, self.head_dim).transpose(1,2) 
-        V_new = V_new.view(batch_size, num_tokens, self.num_kv_groups, self.head_dim).transpose(1,2) 
-
+        #Now let's implement KV Cache on this Latent Vector.
         if kv_cache:
             # pass
-            if self.k_cache is None or self.v_cache is None:
-                # pass
-                self.k_cache, self.v_cache = K_new, V_new
+            if self.c_kv_cache is None :
+                self.c_kv_cache = C_kv_latent_new
             else:
-                K = torch.cat(tensors=[self.k_cache, K_new], dim=2)  #Concating along the num_tokens dimension
-                V = torch.cat(tensors=[self.v_cache, V_new], dim=2)
-            #Updating the KV Cache with new tokens.
-            #Once we have got the old Keys & Values concatenated withnew Ones now time for Attention Calculation.
-            K, V = self.k_cache, self.v_cache
+                self.c_kv_cache = torch.cat(tensors=[self.c_kv_cache, C_kv_latent_new], dim=1)
+            
+            C_kv_latent_total = self.c_kv_cache
+
         else:
-            #As we are not using KV Cache so we can directly assign.
-            K, V = K_new, V_new
+            # pass
+            C_kv_latent_total = C_kv_latent_new
+            self.c_kv_cache = None
 
-        ####### Newly Modified Part for Grouped Query ATtention #####
-        #Checkout torch.tensor.repeat_interleave(): https://docs.pytorch.org/docs/2.14/generated/torch.repeat_interleave.html
-        # Expanding keys and values to match the number of heads
-        #Since we have Query dim=1 as self.num_heads So to copy the Key & Value tensors as same size so we have to do this.
-        #Input Shape:(batch, num_kv_groups, K_num_tokens, head_dim)  --> Output Shape:(batch, num_heads, K_num_tokens, head_dim)
-        K = K.repeat_interleave(repeats=self.group_size, dim=1)  
-        V = V.repeat_interleave(repeats=self.group_size, dim=1)
-        # For example, before repeat_interleave along dim=1 (query groups):
-        #   [K1, K2]
-        # After repeat_interleave (each query group is repeated group_size times):
-        #   [K1, K1, K2, K2]
-        # If we used regular repeat instead of repeat_interleave, we'd get:
-        #   [K1, K2, K1, K2]
+        #Now we can upsample the dim_size and retreive the Keys & Values Vectors from cached C_kv_latent_total
+        #(batch, num_tokens, latent_dim) -- > (batch, num_tokens, d_out)
+        K = self.W_ku(C_kv_latent_total)
+        V = self.W_vu(C_kv_latent_total)
 
-        #Note: Instead of using repeat_interleave we can use broadcasting in pytorch.
-        #Broadcasting Method for Attention (Alternative): 
-        # Q.view(batch_size, self.num_kv_groups, self.group_size, Q_num_tokens, self.head_dim) @ K.view(batch_size, self.num_kv_groups, 1, K_num_tokens, self.head_dim).transpose(2,3)
+        #Let's break the d_out dim into multiple heads & also transposing the num_tokens & num_heads dimension
+        #(batch, num_tokens, d_out) -- > (batch, num_tokens, num_heads, head_dim) --> (batch, num_heads, num_tokens, head_dim)
+        Q = Q.view(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1,2)
+        K = K.view(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1,2)
+        V = V.view(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1,2)
 
-        #Scaled dot product Attention.
-        attn_scores = Q @ K.transpose(2,3)   #Output Shape:(batch, num_heads, Q_num_tokens, K_num_tokens)
-        #Q_num_tokens is the number of query tokens & K_num_tokens is the cached+new set of tokens.
+        attn_scores = Q @ K.transpose(2,3)
 
-
-        ######## Newly Modified Causal Masking After Attention Score Calculation. ##########
-        #Alternative & Better Robust way to Calculate Causal Masking when Query_length & Total Ccahed Key, Value length is different.
+        ######### Applying Causal Attention Mask #######
         num_tokens_Q = Q.shape[-2]
         num_tokens_K = K.shape[-2]
         device = Q.device
         if kv_cache:
-            # pass
-            #Output SHape:(num_tokens_Q,)
+            #Output SHape:(num_tokens_Q, )
             Q_positions = torch.arange(
-                start = self.ptr_current_pos,
-                end= self.ptr_current_pos + num_tokens_Q,
-                dtype=None,
-                device=device
+                start= self.ptr_current_pos,
+                end = self.ptr_current_pos + num_tokens_Q,
+                dtype = None,
+                device = device
             )
-            #Update the tracking variable till latest cached num_tokens.
             self.ptr_current_pos += num_tokens_Q
         else:
-            #Output SHape:(num_tokens_Q,)
-            Q_positions = torch.arange(
-                end= self.ptr_current_pos + num_tokens_Q,
-                dtype=None,
-                device=device
-            )
-            self.ptr_current_pos = 0  #As in this case no KV Cache stored so points to zero.
-            #Output SHape:(num_tokens_K,)
-        K_positions = torch.arange(end=num_tokens_K, dtype=None, device=device)
+            #Output SHape:(num_tokens_Q, )
+            Q_positions = torch.arange(self.ptr_current_pos + num_tokens_Q, dtype=torch.long, device=device)
+            self.ptr_current_pos = 0
 
-        #### ALternative Masking Dynamically unlike creating static Upper Triangular Matrices.
-        # [[num_tokens_Q],] i.e (num_tokens_Q, 1) < [1, [num_tokens_K]] i.e (1, num_tokens_K) --> Gives Matrix of (num_tokens_Q, num_tokens_K)
-        #This happens as a result of broadcasting in Pytorch.
-        mask = Q_positions.unsqueeze(-1) < K_positions.unsqueeze(0)  
+        #Output SHape:(num_tokens_K, )
+        K_positions = torch.arange(num_tokens_K, dtype=torch.long, device=device)
+        # (num_tokens_Q, 1) < (1, num_tokens_K) --> (num_tokens_Q, num_tokens_K) Matrix of comparison.
+        causal_mask = Q_positions.unsqueeze(-1) < K_positions.unsqueeze(0)
 
-        #Example:
-        '''
-        Suppose : Q_positions = [5, 6, 7] (Shape:(3,) or [3]) & K_positions = [0,1,2,3,4,5,6,7]    shape [8]
-        So Q_positions.unsqueeze(-1) = [[5],[6],[7]] (Shape:(3,1)) & K_positions.unsqueeze(0) = [[0,1,2,3,4,5,6,7]] (Shape:((1,8)))
-        And comparing (3,1) & (1,8) allowed broadcasting so became a matrix of shape:(3,8)
-                   
-            Q            K →
-            ↓   0  1  2  3  4  5  6  7
-            5   5   5  5  5  5  5  5  5  
-            6   6  6  6  6  6  6  6  6
-            7   7  7  7  7  7  7  7  7
-                ↓
-                compare
-        
-        Hence since Q_pos & K_pos were positional indices so for position 5 we cant calculate Attention beyond 5 so it should be False mask from 5 to 7 and so on.
-        So the comparison becomes:
+        attn_scores.masked_fill_(causal_mask, -torch.inf)
+        attn_weights = torch.softmax(input=attn_scores/K.shape[-1]**0.5, dim=-1)
+        attn_weights = self.dropout(attn_weights)
 
-            5 < [0,1,2,3,4,5,6,7]
-            6 < [0,1,2,3,4,5,6,7]
-            7 < [0,1,2,3,4,5,6,7]
-
-        giving:
-
-            [[False, False, False, False, False, False, True,  True ],
-            [False, False, False, False, False, False, False, True ],
-            [False, False, False, False, False, False, False, False]]
-        
-        '''
-
-        attn_scores.masked_fill_(mask, -torch.inf)
-
-        assert K.shape[-1] == self.head_dim, 'K embedding dim should be same as Each Head Embedding Dimension'
-        attn_weights = torch.softmax(input=attn_scores / K.shape[-1]**0.5, dim=-1) #Output Shape :(batch, num_heads, Q_num_tokens, K_num_tokens)
-
-        #Since Keys & Values are of same dim i.e K_num_tokens = V_num_tokens
-        #(batch, num_heads, Q_num_tokens, K_num_tokens) @ (batch, num_heads, V_num_tokens, head_dim) --> (batch, num_heads, Q_num_tokens, head_dim)
-        context_vectors = attn_weights @ V 
-        context_vectors = context_vectors.transpose(1,2)    #Output Shape:(batch, Q_num_tokens, num_heads, head_dim)
-
-         # Combine heads, where self.d_out = self.num_heads * self.head_dim
+        #num_tokens_V == num_tokens_K
+        #(batch, num_heads, num_tokens_Q, num_tokens_K) @ (batch, num_heads, num_tokens_V, head_dim) --> (batch, num_heads, num_tokens_Q, head_dim)
+        context_vectors = attn_weights @ V
+        context_vectors = context_vectors.transpose(1,2)   #(batch, num_tokens_Q, num_heads, head_dim)
         context_vectors = context_vectors.contiguous().view(batch_size, num_tokens, self.d_out)
+
         context_vectors = self.out_proj(context_vectors)
 
         return  context_vectors
 
     def reset_cache(self):
-        self.cache_k, self.cache_v = None, None
+
+        self.c_kv_cache = None
         self.ptr_current_pos = 0
 
 
 
 
-
 #Naive/Simple KV Cache Implementation on Transformer Block.
-class TransformerBlockGQACachedSimple(nn.Module):
+class TransformerBlockMLACachedSimple(nn.Module):
 
     def __init__(self, cfg):
         super().__int__()
 
-        self.attn = GroupedQueryAttentionCachedSimple(
+        self.attn = MultiHeadLatentAttention(
             d_in = cfg['emb_dim'],
             d_out = cfg['emb_dim'],
             context_length = cfg['context_length'],
             num_heads = cfg['n_heads'],
-            num_kv_groups = cfg['num_kv_groups'],
+            latent_dim=cfg["latent_dim"],
             dropout = 0.1,
             qkv_bias = cfg['qkv_bias']
         )
@@ -366,9 +300,11 @@ class TransformerBlockGQACachedSimple(nn.Module):
 
 
 
-#Gpt Model Class with GQA & Naive KV Cache Implementation.
-class GPTModelGQACachedSimple(nn.Module):
-    '''KV Cache Implementation GPT Model Class.
+
+
+#Gpt Model Class with MLA & Naive KV Cache Implementation.
+class GPTModelMLACachedSimple(nn.Module):
+    '''KV Cache Implementation GPT Model Class with Multi Head Latent Attention.
     A. Caveat : This implementation has one major Caveat which is if the input_sequence is equal to context_size of model or during KV Caching
         the context size is filled since we are already have the KV cached so this one doesn't work at all.
         For this problem we need to use a window size like rolling KV Cache Mechanism.
@@ -385,7 +321,7 @@ class GPTModelGQACachedSimple(nn.Module):
         #             *[TransformerBlock(cfg) for _ in range(cfg['n_layers'])]
         #         )
         self.trf_blocks = nn.ModuleList(
-            [TransformerBlockGQACachedSimple(cfg) for _ in range(cfg['n_layers'])]
+            [TransformerBlockMLACachedSimple(cfg) for _ in range(cfg['n_layers'])]
         )
 
         #We also need a Position Counter here as well for tracking for many tokens have been cached.
@@ -481,6 +417,8 @@ def generate_text_greedy_cached_simple(model, idx, context_length, max_new_token
         
 
     return  idx
+
+
 
 
 
